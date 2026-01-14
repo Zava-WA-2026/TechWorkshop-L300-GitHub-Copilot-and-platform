@@ -1,7 +1,8 @@
 using Azure;
-using Azure.AI.Inference;
+using Azure.AI.OpenAI;
 using Azure.AI.ContentSafety;
 using Azure.Identity;
+using OpenAI.Chat;
 using ZavaStorefront.Models;
 
 namespace ZavaStorefront.Services;
@@ -13,7 +14,7 @@ public interface IChatService
 
 public class ChatService : IChatService
 {
-    private readonly ChatCompletionsClient _client;
+    private readonly AzureOpenAIClient _client;
     private readonly ContentSafetyClient _contentSafetyClient;
     private readonly ILogger<ChatService> _logger;
     private readonly string _modelName;
@@ -25,19 +26,20 @@ public class ChatService : IChatService
         
         var endpoint = configuration["AzureAI:Endpoint"] 
             ?? throw new InvalidOperationException("AzureAI:Endpoint is not configured");
-        _modelName = configuration["AzureAI:ModelName"] ?? "Phi-4";
+        var contentSafetyEndpoint = configuration["AzureAI:ContentSafetyEndpoint"] 
+            ?? "https://aizavadevdyu3e.cognitiveservices.azure.com/";
+        _modelName = configuration["AzureAI:ModelName"] ?? "gpt-4o-mini";
 
         var credential = new DefaultAzureCredential();
 
         // Use DefaultAzureCredential for managed identity authentication
-        // This supports local development (Azure CLI, VS Code) and production (Managed Identity)
-        _client = new ChatCompletionsClient(
+        _client = new AzureOpenAIClient(
             new Uri(endpoint),
             credential);
         
-        // Initialize Content Safety client using the same endpoint
+        // Initialize Content Safety client using the Cognitive Services endpoint
         _contentSafetyClient = new ContentSafetyClient(
-            new Uri(endpoint),
+            new Uri(contentSafetyEndpoint),
             credential);
         
         _logger.LogInformation("ChatService initialized with managed identity authentication and content safety");
@@ -116,35 +118,36 @@ public class ChatService : IChatService
             }
             
             // Step 2: Process safe messages through the AI model
-            var messages = new List<ChatRequestMessage>
+            var chatClient = _client.GetChatClient(_modelName);
+            
+            var messages = new List<OpenAI.Chat.ChatMessage>
             {
-                new ChatRequestSystemMessage("You are a helpful AI assistant for Zava Storefront. Help customers with questions about products, pricing, and general inquiries. Be friendly and professional.")
+                new SystemChatMessage("You are a helpful AI assistant for Zava Storefront. Help customers with questions about products, pricing, and general inquiries. Be friendly and professional.")
             };
 
             // Add conversation history
             foreach (var msg in request.History)
             {
                 if (msg.Role.ToLower() == "user")
-                    messages.Add(new ChatRequestUserMessage(msg.Content));
+                    messages.Add(new UserChatMessage(msg.Content));
                 else if (msg.Role.ToLower() == "assistant")
-                    messages.Add(new ChatRequestAssistantMessage(msg.Content));
+                    messages.Add(new AssistantChatMessage(msg.Content));
             }
 
             // Add the current message
-            messages.Add(new ChatRequestUserMessage(request.Message));
+            messages.Add(new UserChatMessage(request.Message));
 
-            var options = new ChatCompletionsOptions(messages)
+            var options = new ChatCompletionOptions
             {
-                Model = _modelName,
-                MaxTokens = 1000,
+                MaxOutputTokenCount = 1000,
                 Temperature = 0.7f
             };
 
-            var response = await _client.CompleteAsync(options);
+            var response = await chatClient.CompleteChatAsync(messages, options);
 
             return new ChatResponse
             {
-                Response = response.Value.Content,
+                Response = response.Value.Content[0].Text,
                 Success = true
             };
         }
