@@ -8,9 +8,10 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}
+  ACR_NAME: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}
+  REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io
   IMAGE_NAME: zavastorefront
-  APP_NAME: ${{ vars.WEBAPP_NAME }}
+  APP_NAME: ${{ vars.AZURE_APP_SERVICE_NAME }}
 
 jobs:
   build-and-deploy:
@@ -26,7 +27,7 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Log in to Azure Container Registry
-        run: az acr login --name ${{ vars.ACR_NAME }}
+        run: az acr login --name ${{ env.ACR_NAME }}
 
       - name: Build and push Docker image
         run: |
