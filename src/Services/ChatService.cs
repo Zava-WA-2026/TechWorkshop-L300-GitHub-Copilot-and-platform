@@ -1,5 +1,7 @@
 using Azure;
 using Azure.AI.Inference;
+using Azure.AI.ContentSafety;
+using Azure.Identity;
 using ZavaStorefront.Models;
 
 namespace ZavaStorefront.Services;
@@ -12,8 +14,10 @@ public interface IChatService
 public class ChatService : IChatService
 {
     private readonly ChatCompletionsClient _client;
+    private readonly ContentSafetyClient _contentSafetyClient;
     private readonly ILogger<ChatService> _logger;
     private readonly string _modelName;
+    private const int UnsafeSeverityThreshold = 2;
 
     public ChatService(IConfiguration configuration, ILogger<ChatService> logger)
     {
@@ -21,19 +25,97 @@ public class ChatService : IChatService
         
         var endpoint = configuration["AzureAI:Endpoint"] 
             ?? throw new InvalidOperationException("AzureAI:Endpoint is not configured");
-        var apiKey = configuration["AzureAI:ApiKey"] 
-            ?? throw new InvalidOperationException("AzureAI:ApiKey is not configured");
         _modelName = configuration["AzureAI:ModelName"] ?? "Phi-4";
 
+        var credential = new DefaultAzureCredential();
+
+        // Use DefaultAzureCredential for managed identity authentication
+        // This supports local development (Azure CLI, VS Code) and production (Managed Identity)
         _client = new ChatCompletionsClient(
             new Uri(endpoint),
-            new AzureKeyCredential(apiKey));
+            credential);
+        
+        // Initialize Content Safety client using the same endpoint
+        _contentSafetyClient = new ContentSafetyClient(
+            new Uri(endpoint),
+            credential);
+        
+        _logger.LogInformation("ChatService initialized with managed identity authentication and content safety");
+    }
+
+    /// <summary>
+    /// Evaluates user input for content safety violations.
+    /// Returns a tuple indicating if the content is safe and any warning message.
+    /// </summary>
+    private async Task<(bool IsSafe, string? WarningMessage)> EvaluateContentSafetyAsync(string userMessage)
+    {
+        try
+        {
+            var request = new AnalyzeTextOptions(userMessage);
+            
+            var response = await _contentSafetyClient.AnalyzeTextAsync(request);
+            
+            var categories = new Dictionary<string, int?>
+            {
+                { "Violence", response.Value.CategoriesAnalysis.FirstOrDefault(c => c.Category == TextCategory.Violence)?.Severity },
+                { "Sexual", response.Value.CategoriesAnalysis.FirstOrDefault(c => c.Category == TextCategory.Sexual)?.Severity },
+                { "SelfHarm", response.Value.CategoriesAnalysis.FirstOrDefault(c => c.Category == TextCategory.SelfHarm)?.Severity },
+                { "Hate", response.Value.CategoriesAnalysis.FirstOrDefault(c => c.Category == TextCategory.Hate)?.Severity }
+            };
+            
+            // Log all category scores
+            _logger.LogInformation(
+                "ContentSafety evaluation - Violence: {Violence}, Sexual: {Sexual}, SelfHarm: {SelfHarm}, Hate: {Hate}",
+                categories["Violence"] ?? 0,
+                categories["Sexual"] ?? 0,
+                categories["SelfHarm"] ?? 0,
+                categories["Hate"] ?? 0);
+            
+            // Check if any category exceeds the threshold
+            foreach (var category in categories)
+            {
+                if (category.Value.HasValue && category.Value.Value >= UnsafeSeverityThreshold)
+                {
+                    _logger.LogWarning(
+                        "ContentSafety violation detected - Category: {Category}, Severity: {Severity}, Threshold: {Threshold}",
+                        category.Key,
+                        category.Value.Value,
+                        UnsafeSeverityThreshold);
+                    
+                    return (false, $"Your message was flagged for potentially unsafe content ({category.Key}). Please rephrase your question.");
+                }
+            }
+            
+            _logger.LogInformation("ContentSafety check passed - Message is safe");
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ContentSafety evaluation failed - Error: {ErrorMessage}", ex.Message);
+            // If content safety check fails, we'll allow the message but log the error
+            // In production, you might want to block instead
+            return (true, null);
+        }
     }
 
     public async Task<ChatResponse> GetResponseAsync(ChatRequest request)
     {
         try
         {
+            // Step 1: Evaluate content safety before processing
+            var (isSafe, warningMessage) = await EvaluateContentSafetyAsync(request.Message);
+            
+            if (!isSafe)
+            {
+                _logger.LogWarning("ContentSafety blocked message - User message was flagged as unsafe");
+                return new ChatResponse
+                {
+                    Success = false,
+                    Error = warningMessage ?? "Your message contains content that violates our safety guidelines. Please try a different question."
+                };
+            }
+            
+            // Step 2: Process safe messages through the AI model
             var messages = new List<ChatRequestMessage>
             {
                 new ChatRequestSystemMessage("You are a helpful AI assistant for Zava Storefront. Help customers with questions about products, pricing, and general inquiries. Be friendly and professional.")
